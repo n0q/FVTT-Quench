@@ -65,9 +65,10 @@ interface RunCounters {
 /**
  * The visual UI for representing Quench test batches and the tests results thereof.
  *
- * The report is failures-only: every batch gets a single summary line whose counts are updated in
- * place, and only failing suites, tests, and hooks are materialised as rows in the DOM. Passing and
- * pending tests never enter the DOM, which keeps the attached tree small for large runs.
+ * The report only surfaces what needs attention: every batch gets a single summary line whose
+ * counts are updated in place, and only failing or pending suites, tests, and hooks are
+ * materialised as rows in the DOM. Passing tests never enter the DOM, which keeps the attached
+ * tree small for large runs.
  *
  * @internal
  */
@@ -658,16 +659,24 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 	}
 
 	/**
-	 * Creates a new `<li>` representing a failing runnable
+	 * Creates a new `<li>` representing a runnable that is surfaced in the tree (failing or pending)
 	 * @param title - The runnable title to show in the UI.
 	 * @param id - The mocha id of the runnable.
 	 * @param isTest - Whether this runnable is a test (or a suite, if false)
+	 * @param state - The final state shown by the row's status icon
 	 * @returns The `<li>` element representing this runnable.
 	 */
-	private static _makeFailureLineItem(title: string, id: string, isTest: boolean): HTMLLIElement {
+	private static _makeLineItem(
+		title: string,
+		id: string,
+		isTest: boolean,
+		state: RUNNABLE_STATE,
+	): HTMLLIElement {
 		const type = isTest ? "test" : "suite";
 		const typeIcon = isTest ? "fa-flask" : "fa-folder";
 		const expanderIcon = isTest ? "fa-caret-right" : "fa-caret-down";
+		// Pending tests carry no diagnostic, so there is nothing to expand
+		const expanderHidden = isTest && state === RUNNABLE_STATES.PENDING ? " quench-hidden" : "";
 		const li = document.createElement("li");
 		li.classList.add(type);
 		li.id = id;
@@ -677,12 +686,14 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 		summary.append(
 			createNode("i", {
 				attr: {
-					class: `expander fas ${expanderIcon}`,
+					class: `expander fas ${expanderIcon}${expanderHidden}`,
 					"data-action": "expand",
 					"data-expand-target": id,
 				},
 			}),
-			createNode("i", { attr: { class: "status-icon fas fa-times-circle" } }),
+			createNode("i", {
+				attr: { class: `status-icon fas ${QuenchResults._statusIconClass(state)}` },
+			}),
 			createNode("i", { attr: { class: `type-icon fas ${typeIcon}` } }),
 			createNode("span", { attr: { class: "runnable-title" }, children: title }),
 		);
@@ -703,33 +714,63 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 
 	/**
 	 * Return the row for a suite, materialising it and any missing ancestors on first use.
-	 * Only suites containing a failure are ever materialised.
+	 * Only suites containing a failing or pending descendant are ever materialised. A suite
+	 * created for a pending descendant is upgraded to the failure icon if a failure follows.
 	 */
-	private _ensureSuiteLineItem(suite: Mocha.Suite, batch: BatchEntry): HTMLLIElement {
+	private _ensureSuiteLineItem(
+		suite: Mocha.Suite,
+		batch: BatchEntry,
+		state: RUNNABLE_STATE,
+	): HTMLLIElement {
 		const existing = this._suiteElements.get(suite);
-		if (existing) return existing;
+		if (existing) {
+			if (state === RUNNABLE_STATES.FAILURE) QuenchResults._markSuiteFailed(existing);
+			return existing;
+		}
 
-		const parent = suite.parent;
-		const parentContainer =
-			!parent || parent.root || parent._quench_batchRoot
-				? batch.contents
-				: (this._ensureSuiteLineItem(parent, batch).querySelector<HTMLElement>(
-						":scope > .expandable",
-					) ?? batch.contents);
-
-		const li = QuenchResults._makeFailureLineItem(suite.title, suite.id, false);
-		QuenchResults._findOrMakeChildList(parentContainer).append(li);
+		const container = this._getParentContainer(suite.parent, batch, state);
+		const li = QuenchResults._makeLineItem(suite.title, suite.id, false, state);
+		QuenchResults._findOrMakeChildList(container).append(li);
 		this._suiteElements.set(suite, li);
 		return li;
 	}
 
+	/** Switch a materialised suite row's status icon to failure. */
+	private static _markSuiteFailed(suiteLi: HTMLLIElement) {
+		const icon = suiteLi.querySelector<HTMLElement>(":scope > .summary > .status-icon");
+		if (icon && !icon.classList.contains("fa-times-circle")) {
+			QuenchResults._setStatusIcon(icon, RUNNABLE_STATES.FAILURE);
+		}
+	}
+
 	/** Return the container into which a runnable's own row belongs. */
-	private _getParentContainer(parent: Mocha.Suite | undefined, batch: BatchEntry): HTMLElement {
+	private _getParentContainer(
+		parent: Mocha.Suite | undefined,
+		batch: BatchEntry,
+		state: RUNNABLE_STATE,
+	): HTMLElement {
 		if (!parent || parent.root || parent._quench_batchRoot) return batch.contents;
 		return (
-			this._ensureSuiteLineItem(parent, batch).querySelector<HTMLElement>(":scope > .expandable") ??
-			batch.contents
+			this._ensureSuiteLineItem(parent, batch, state).querySelector<HTMLElement>(
+				":scope > .expandable",
+			) ?? batch.contents
 		);
+	}
+
+	/** Materialise a row for a test, together with its ancestor suites, if it does not exist yet. */
+	private _ensureTestLineItem(
+		test: Mocha.Test,
+		batch: BatchEntry,
+		state: RUNNABLE_STATE,
+	): HTMLLIElement {
+		const existing = this._testElements.get(test);
+		if (existing) return existing;
+
+		const container = this._getParentContainer(test.parent, batch, state);
+		const li = QuenchResults._makeLineItem(test.title, test.id, true, state);
+		QuenchResults._findOrMakeChildList(container).append(li);
+		this._testElements.set(test, li);
+		return li;
 	}
 
 	private static _getErrorDiff(error: {
@@ -849,7 +890,8 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 	}
 
 	/**
-	 * Called by {@link QuenchReporter} when a mocha test finishes running without failing
+	 * Called by {@link QuenchReporter} when a mocha test finishes running without failing.
+	 * Passing tests only update counters; pending tests are surfaced as rows like failures are.
 	 *
 	 * @param test - The finished test
 	 */
@@ -859,7 +901,10 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 
 		if (state === RUNNABLE_STATES.PENDING) {
 			this._runCounters.pending += 1;
-			if (entry) entry.pending += 1;
+			if (entry) {
+				entry.pending += 1;
+				this._ensureTestLineItem(test, entry, RUNNABLE_STATES.PENDING);
+			}
 		} else if (state === RUNNABLE_STATES.SUCCESS) {
 			this._runCounters.passed += 1;
 			if (entry) entry.passed += 1;
@@ -913,13 +958,7 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 
 	/** Materialise a failed test row, together with its ancestor suites, and append its diagnostic. */
 	private _appendTestFailure(test: Mocha.Test, error: unknown, batch: BatchEntry): HTMLElement {
-		let testLi = this._testElements.get(test);
-		if (!testLi) {
-			const container = this._getParentContainer(test.parent, batch);
-			testLi = QuenchResults._makeFailureLineItem(test.title, test.id, true);
-			QuenchResults._findOrMakeChildList(container).append(testLi);
-			this._testElements.set(test, testLi);
-		}
+		const testLi = this._ensureTestLineItem(test, batch, RUNNABLE_STATES.FAILURE);
 
 		const expandable = testLi.querySelector<HTMLElement>(":scope > .expandable") ?? testLi;
 		const diagnostic = this._createFailureDiagnostic(error);
@@ -936,7 +975,7 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 		const suite = hook.parent;
 		if (!suite || suite.root || suite._quench_batchRoot) return null;
 
-		const suiteLi = this._ensureSuiteLineItem(suite, batch);
+		const suiteLi = this._ensureSuiteLineItem(suite, batch, RUNNABLE_STATES.FAILURE);
 		const expandable = suiteLi.querySelector<HTMLElement>(":scope > .expandable");
 		if (!expandable) return null;
 
@@ -1235,6 +1274,15 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 		if (!this.rendered) return;
 
 		this._cacheFailureTargets();
+		if (
+			this._runCounters.passed !== stats.passes ||
+			this._runCounters.pending !== stats.pending ||
+			this._runCounters.failed !== stats.failures
+		) {
+			console.warn(
+				`${logPrefix}Live counter mismatch: counted ${this._runCounters.passed} passed, ${this._runCounters.pending} pending, ${this._runCounters.failed} failed; Mocha reported ${stats.passes}, ${stats.pending}, ${stats.failures}.`,
+			);
+		}
 		const countsAgree = this._failureTargets.length === stats.failures;
 		if (stats.failures > 0 && !countsAgree) {
 			console.warn(
