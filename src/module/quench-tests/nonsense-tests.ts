@@ -356,6 +356,112 @@ if (import.meta.env.DEV) {
 			},
 			{ displayName: "QUENCH: Suite Hook Error" },
 		);
+
+		quench.registerBatch(
+			"quench.examples.batch-after-hook-error",
+			(context) => {
+				const { after, it } = context;
+				after(() => {
+					throw new Error("This is an error thrown in a batch's after hook");
+				});
+				it("passes before the batch after hook fails", () => undefined);
+			},
+			{ displayName: "QUENCH: Batch After Hook Error", preSelected: false },
+		);
+
+		quench.registerBatch(
+			"quench.examples.suite-after-hook-error",
+			(context) => {
+				const { after, describe, it } = context;
+				describe("Suite failing in after hook", function () {
+					after(() => {
+						throw new Error("This is an error thrown in a suite's after hook");
+					});
+					it("passes before the suite after hook fails", () => undefined);
+				});
+			},
+			{ displayName: "QUENCH: Suite After Hook Error", preSelected: false },
+		);
+
+		quench.registerBatch(
+			"quench.examples.before-each-hook-error",
+			(context) => {
+				const { beforeEach, describe, it } = context;
+				describe("Suite failing in beforeEach hook", function () {
+					beforeEach(() => {
+						throw new Error("This is an error thrown in a suite's beforeEach hook");
+					});
+					it("does not run", unreachable);
+				});
+			},
+			{ displayName: "QUENCH: Before Each Hook Error", preSelected: false },
+		);
+
+		quench.registerBatch(
+			"quench.examples.after-each-hook-errors",
+			(context) => {
+				const { afterEach, describe, it } = context;
+				describe("Suite with repeated afterEach failures", function () {
+					afterEach(() => {
+						throw new Error("This is an error thrown in a suite's afterEach hook");
+					});
+					it("first passing test", () => undefined);
+					it("second passing test", () => undefined);
+				});
+			},
+			{ displayName: "QUENCH: After Each Hook Errors", preSelected: false },
+		);
+
+		quench.registerBatch(
+			"quench.examples.batch-before-each-hook-error",
+			(context) => {
+				const { beforeEach, it } = context;
+				beforeEach(() => {
+					throw new Error("This is an error thrown in a batch's beforeEach hook");
+				});
+				it("does not run", unreachable);
+			},
+			{ displayName: "QUENCH: Batch Before Each Hook Error", preSelected: false },
+		);
+
+		quench.registerBatch(
+			"quench.examples.batch-after-each-hook-error",
+			(context) => {
+				const { afterEach, it } = context;
+				afterEach(() => {
+					throw new Error("This is an error thrown in a batch's afterEach hook");
+				});
+				it("passes before the batch afterEach hook fails", () => undefined);
+			},
+			{ displayName: "QUENCH: Batch After Each Hook Error", preSelected: false },
+		);
+
+		quench.registerBatch(
+			"quench.examples.root-hook-error",
+			function (context) {
+				const { it } = context;
+				this.parent?.beforeAll("unowned root hook fixture", () => {
+					throw new Error("This is an unowned root hook error");
+				});
+				it("does not run after the root hook fails", unreachable);
+			},
+			{ displayName: "QUENCH: Root Hook Error", preSelected: false },
+		);
+
+		quench.registerBatch(
+			"quench.examples.navigation-edge-cases",
+			(context) => {
+				const { it } = context;
+				quench.mocha.forbidPending();
+				Hooks.once("quenchReports", () => {
+					// @ts-expect-error Mocha's runtime API accepts false, but its declaration does not.
+					quench.mocha.forbidPending(false);
+				});
+				it("pending fixture for Mocha forbid-pending");
+				it('passing title with <span class="error">unrelated error markup</span>', () => undefined);
+			},
+			{ displayName: "QUENCH: Navigation Edge Cases", preSelected: false },
+		);
 	};
 }
 

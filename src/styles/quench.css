@@ -157,7 +157,19 @@
 	font-size: var(--font-size-11, 0.7rem);
 	user-select: text;
 	white-space: pre-wrap;
+	overflow-wrap: anywhere;
 	background-color: var(--error-background-color);
+}
+
+#quench-results .expandable > .error.failure-current {
+	outline: 2px solid var(--color-red);
+	outline-offset: -3px;
+	box-shadow: inset 0 0 0 1px currentColor;
+}
+
+#quench-results .failure-heading {
+	font-weight: bold;
+	margin-bottom: 0.35em;
 }
 
 #quench-results li > .expandable > .error .actual {
@@ -212,6 +224,7 @@
 	background: var(--error-background-color);
 	gap: 0.5rem;
 	display: flex;
+	align-items: baseline;
 }
 
 #quench-results #quench-results-stats div.stats .stats-info {
@@ -226,6 +239,48 @@
 #quench-results #quench-results-stats div.stats .stats-pass {
 	border-color: var(--color-green);
 	color: var(--color-green);
+}
+
+#quench-results #quench-results-stats .failure-navigation {
+	display: inline-flex;
+	align-items: baseline;
+	flex: 0 0 auto;
+	width: auto;
+	min-height: 0;
+	margin: 0;
+	padding: 0;
+	border: 0;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	line-height: inherit;
+}
+
+#quench-results #quench-results-stats .failure-navigation:focus-visible {
+	outline: 2px solid currentColor;
+	outline-offset: 1px;
+}
+
+#quench-results :is(li.test, li.suite, li.run-failure):focus-visible > .summary,
+#quench-results .batch-hook:focus-visible {
+	outline: 2px solid var(--color-red);
+	outline-offset: 2px;
+}
+
+#quench-results .run-failure > .summary > .run-failure-label {
+	font-weight: bold;
+}
+
+#quench-results .quench-visually-hidden {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
 }
 
 #quench-results .quench-hidden {

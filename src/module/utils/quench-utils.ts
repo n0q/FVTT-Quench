@@ -24,6 +24,9 @@ export type RUNNABLE_STATE = (typeof RUNNABLE_STATES)[keyof typeof RUNNABLE_STAT
  * @returns the state of the test
  */
 export function getTestState(test: Mocha.Test): RUNNABLE_STATE {
+	if (test.state === "failed") {
+		return RUNNABLE_STATES.FAILURE;
+	}
 	if (test.pending) {
 		return RUNNABLE_STATES.PENDING;
 	}
@@ -46,13 +49,12 @@ export function getTestState(test: Mocha.Test): RUNNABLE_STATE {
 export function getSuiteState(suite: Mocha.Suite): RUNNABLE_STATE {
 	if (suite.pending) return RUNNABLE_STATES.PENDING;
 
-	// If before hooks failed, mark the suite as failed
-	// @ts-expect-error Only options to assess beforeAll hook state
-	if (suite._beforeAll?.find((hook: Mocha.Hook) => hook.state === "failed"))
-		return RUNNABLE_STATES.FAILURE;
-	// @ts-expect-error Only options to assess beforeEach hook state
-	if (suite._beforeEach?.find((hook: Mocha.Hook) => hook.state === "failed"))
-		return RUNNABLE_STATES.FAILURE;
+	// If any hook failed, mark the suite as failed.
+	for (const property of ["_beforeAll", "_beforeEach", "_afterEach", "_afterAll"] as const) {
+		if (suite[property]?.some((hook: Mocha.Hook) => hook.state === "failed")) {
+			return RUNNABLE_STATES.FAILURE;
+		}
+	}
 
 	// Check child tests
 	const testStates = suite.tests.map((element) => getTestState(element));

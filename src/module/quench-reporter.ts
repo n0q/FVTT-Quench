@@ -155,24 +155,19 @@ export class QuenchReporter extends Mocha.reporters.Base {
 			.on(EVENT_TEST_PASS, (test) => {
 				this.cache.passes.push(test);
 			})
-			.on(EVENT_TEST_FAIL, (test: Mocha.Test | Mocha.Hook, error) => {
-				if (test.type === "hook") {
-					if (test.title.includes("before")) {
-						if (test.parent?._quench_batchRoot) app.handleBatchFail(test, error);
-						else app.handleTestFail(test, error);
-					}
-				} else {
-					this.cache.failures.push(test);
-					app.handleTestFail(test, error);
+			.on(EVENT_TEST_FAIL, (runnable: Mocha.Runnable, error) => {
+				if ((runnable as { type?: string }).type === "test") {
+					this.cache.failures.push(runnable as Mocha.Test);
 				}
+				app.handleTestFail(runnable, error);
 
 				if (QuenchReporter._shouldLogTestDetails()) {
 					console.groupCollapsed(
-						`%c(FAIL) Test Complete: ${test.title}`,
+						`%c(FAIL) Test Complete: ${runnable.title}`,
 						`color: ${CONSOLE_COLORS.fail}`,
-						{ test, err: error },
+						{ test: runnable, err: error },
 					);
-					console.error(error.stack);
+					console.error(error instanceof Error ? error.stack : error);
 					console.groupEnd();
 				}
 			})
