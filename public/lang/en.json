@@ -11,6 +11,8 @@
 		"StatsSummary": "Ran {quantity} tests in {duration}ms.",
 		"StatsPassed": "{passed} passed",
 		"StatsFailed": "{failed} failed",
+		"StatsPending": "{pending} pending",
+		"StatsRunning": "Running: {counts} ({elapsed}s)",
 		"NextFailure": "Go to next failure",
 		"FailurePosition": "{current} of {total}",
 		"FailureAnnouncement": "Failure {current} of {total}: {label}",
@@ -25,8 +27,6 @@
 		"AutoShowQuenchWindowHint": "Will automatically render the Quench window when the game is loaded or refreshed",
 		"AutoRunLabel": "Run on Startup",
 		"AutoRunHint": "Will automatically run all preselected Quench test batches when the game is loaded or refreshed",
-		"CollapseSuccessfulLabel": "Collapse Passing Suites",
-		"CollapseSuccessfulHint": "When enabled, suites for which all children suites and tests are passing will be collapsed by default",
 		"PreselectFiltersLabel": "Preselection Filters",
 		"PreselectFiltersHint": "Only batches matching this list of comma-separated filters will effectively be preselected when the world is loaded. Filters are case-insensitive and may contain wildcards (?, *, and **)",
 

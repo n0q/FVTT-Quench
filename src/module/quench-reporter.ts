@@ -64,7 +64,6 @@ export class QuenchReporter extends Mocha.reporters.Base {
 			EVENT_RUN_END,
 			EVENT_SUITE_BEGIN,
 			EVENT_SUITE_END,
-			EVENT_TEST_BEGIN,
 			EVENT_TEST_PASS,
 			EVENT_TEST_PENDING,
 			EVENT_TEST_END,
@@ -114,9 +113,6 @@ export class QuenchReporter extends Mocha.reporters.Base {
 				if (QuenchReporter._shouldLogTestDetails() && !suite.root) {
 					console.groupEnd();
 				}
-			})
-			.on(EVENT_TEST_BEGIN, (test) => {
-				app.handleTestBegin(test);
 			})
 			.on(EVENT_TEST_PENDING, (test) => {
 				this.cache.pending.push(test);

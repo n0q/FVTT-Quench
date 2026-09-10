@@ -7,17 +7,18 @@
         <button type="button" data-action="select" data-select="all">{{localize "QUENCH.SelectAll"}}</button>
         <button type="button" data-action="select" data-select="none">{{localize "QUENCH.SelectNone"}}</button>
     </div>
+    <div id="quench-results-stats" style="display: none"></div>
     <div id="quench-batches">
         <ul id="quench-batches-list">
             {{#each batches}}
                 <li class="test-batch" data-batch="{{this.name}}">
-                <label><input type="checkbox" {{checked this.selected}} />{{this.displayName}}</label>
+                    <label><input type="checkbox" {{checked this.selected}} />{{this.displayName}}</label>
+                    <span class="batch-summary" hidden><i class="status-icon fas"></i><span class="batch-counts"></span></span>
                     <div class="expandable expanded"></div>
                 </li>
             {{/each}}
         </ul>
     </div>
-    <div id="quench-results-stats" style="display: none"></div>
     <p id="quench-failure-announcement" class="quench-visually-hidden" aria-live="polite" aria-atomic="true"></p>
     <div class="controls-container footer" >
         <button id="quench-run" data-action="run">{{localize "QUENCH.Run"}}</button>

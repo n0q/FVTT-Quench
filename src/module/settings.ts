@@ -11,7 +11,6 @@ declare module "fvtt-types/configuration" {
 	interface SettingConfig {
 		"quench.logTestDetails": BooleanSetting<true>;
 		"quench.exampleTests": BooleanSetting<false>;
-		"quench.collapseSuccessful": BooleanSetting<false>;
 		"quench.autoShowQuenchWindow": BooleanSetting<false>;
 		"quench.autoRun": BooleanSetting<false>;
 		"quench.preselectFilters": fields.StringField<{
@@ -44,14 +43,6 @@ export function registerSettings(): void {
 		config: true,
 		type: new fields.BooleanField({ required: true, initial: false }),
 		requiresReload: true,
-	});
-
-	game.settings.register(MODULE_ID, "collapseSuccessful", {
-		name: "QUENCH.CollapseSuccessfulLabel",
-		hint: "QUENCH.CollapseSuccessfulHint",
-		scope: "client",
-		config: true,
-		type: new fields.BooleanField({ required: true, initial: false }),
 	});
 
 	game.settings.register(MODULE_ID, "autoShowQuenchWindow", {

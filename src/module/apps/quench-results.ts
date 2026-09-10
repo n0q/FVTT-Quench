@@ -12,7 +12,6 @@ import {
 	enforce,
 	getFilterSetting,
 	getGame,
-	getSuiteState,
 	getTestState,
 	localize,
 	logPrefix,
@@ -39,8 +38,36 @@ interface FailureError {
 	snapshotError?: boolean;
 }
 
+/** Per-run bookkeeping for a single test batch, resolved once instead of via DOM scans. */
+interface BatchEntry {
+	/** The batch's `<li>` rendered by the template */
+	li: HTMLLIElement;
+	/** The batch's `.expandable` container into which failing rows are rendered */
+	contents: HTMLElement;
+	/** The batch summary line following the batch label */
+	summary: HTMLElement;
+	/** The status icon inside the summary line */
+	statusIcon: HTMLElement;
+	/** The text node carrying the batch's counts */
+	countsText: Text;
+	passed: number;
+	failed: number;
+	pending: number;
+}
+
+/** Live counters for the current run, mirrored into the stats area while tests execute. */
+interface RunCounters {
+	passed: number;
+	failed: number;
+	pending: number;
+}
+
 /**
  * The visual UI for representing Quench test batches and the tests results thereof.
+ *
+ * The report is failures-only: every batch gets a single summary line whose counts are updated in
+ * place, and only failing suites, tests, and hooks are materialised as rows in the DOM. Passing and
+ * pending tests never enter the DOM, which keeps the attached tree small for large runs.
  *
  * @internal
  */
@@ -67,6 +94,30 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 	private _resultsRootElement: HTMLElement | null = null;
 	private _failurePositionElement: HTMLElement | null = null;
 	private _failureAnnouncementElement: HTMLElement | null = null;
+
+	/** Batch bookkeeping for the current run, keyed by batch key. */
+	private _batches = new Map<QuenchBatchKey, BatchEntry>();
+
+	/** Materialised suite rows for the current run, keyed by Mocha suite identity. */
+	private _suiteElements = new WeakMap<Mocha.Suite, HTMLLIElement>();
+
+	/** Materialised test rows for the current run, keyed by Mocha test identity. */
+	private _testElements = new WeakMap<Mocha.Test, HTMLLIElement>();
+
+	/** Live counters for the current run. */
+	private _runCounters: RunCounters = { passed: 0, failed: 0, pending: 0 };
+
+	/** Text node showing live progress while a run is in progress. */
+	private _liveStatsText: Text | null = null;
+
+	/** Timestamp at which the current run started. */
+	private _runStartedAt = 0;
+
+	/** Interval handle refreshing the elapsed time while a run is in progress. */
+	private _liveStatsTimer: ReturnType<typeof setInterval> | null = null;
+
+	/** Whether a Mocha run is currently in progress. */
+	private _runInProgress = false;
 
 	/**
 	 * @param quench - The `Quench` instance this `Application` belongs to
@@ -156,6 +207,7 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 	override async _onRender(context: QuenchResultData, options: ApplicationV2.RenderOptions) {
 		super._onRender(context, options);
 		this._resetFailureNavigation(true);
+		this._forgetRenderedRows();
 		this._hasFilteredRows = false;
 		this._resultsRootElement = this.element.querySelector(":scope > .window-content");
 		this._failureAnnouncementElement =
@@ -163,6 +215,15 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 		this._failureAnnouncementElement?.replaceChildren();
 		// @ts-expect-error SearchFilter types have not been updated yet
 		this.#searchFilter.bind(this.element);
+
+		// A window re-rendered mid-run picks the live progress line back up
+		if (this._runInProgress) this._startLiveStats();
+	}
+
+	/** @inheritDoc */
+	protected override _onClose(options: ApplicationV2.RenderOptions) {
+		super._onClose(options);
+		this._stopLiveStats();
 	}
 
 	/* -------------------------------------------- */
@@ -482,44 +543,128 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 	 * @returns An array of {@link QuenchBatchKey}s belonging to batches checked in the UI
 	 */
 	private _getCheckedBatches(): QuenchBatchKey[] {
-		const batchEls: NodeListOf<HTMLElement> =
-			this.element.querySelectorAll("#quench-batches-list li");
+		const batchEls: NodeListOf<HTMLElement> = this.element.querySelectorAll(
+			"#quench-batches-list > li.test-batch",
+		);
 		const batches: QuenchBatchKey[] = [];
 		for (const batchElement of batchEls) {
-			const enabled = (batchElement.querySelector("input[type=checkbox") as HTMLInputElement)
-				?.checked;
+			const enabled = (
+				batchElement.querySelector(":scope > label > input[type=checkbox]") as HTMLInputElement
+			)?.checked;
 			const key = batchElement.dataset.batch;
 			if (key && enabled) batches.push(key as QuenchBatchKey);
 		}
 		return batches;
 	}
 
-	/**
-	 * Finds or creates an unordered list to contain items for each child runnable (test or suite) of the given parent
-	 * @param parentListElement - The <li> of the parent test batch or suite
-	 * @returns The <ul> into which child runnables can be inserted.
-	 */
-	private _findOrMakeChildList(parentListElement: HTMLElement): HTMLElement {
-		const expandable = parentListElement.querySelector("div.expandable");
-		const childList = expandable?.querySelectorAll("ul.runnable-list");
-		if (childList?.length === 0) {
-			const newChildList = document.createElement("ul");
-			newChildList.classList.add("runnable-list");
-			expandable?.insertAdjacentElement("beforeend", newChildList);
-			return newChildList;
-		}
-		enforce(childList);
-		return childList[0] as HTMLUListElement;
+	/** Forget all references into rendered rows; the DOM they referred to is replaced or gone. */
+	private _forgetRenderedRows() {
+		this._stopLiveStats();
+		this._batches = new Map();
+		this._suiteElements = new WeakMap();
+		this._testElements = new WeakMap();
+		this._liveStatsText = null;
+	}
+
+	/** Reset all per-run bookkeeping at the start of a run. */
+	private _resetRunBookkeeping() {
+		this._forgetRenderedRows();
+		this._runCounters = { passed: 0, failed: 0, pending: 0 };
 	}
 
 	/**
-	 * Creates a new <li> to represent the runnable given by the provided details
+	 * Resolve the per-run bookkeeping entry for a batch, creating it from the rendered batch row
+	 * on first use. The batch list is rendered once by the template, so this is a one-time scoped
+	 * lookup per batch rather than a per-test scan of the results tree.
+	 */
+	private _getBatchEntry(batchKey: string): BatchEntry | null {
+		if (!batchKey) return null;
+		const existing = this._batches.get(batchKey as QuenchBatchKey);
+		if (existing) return existing;
+		if (!this.rendered) return null;
+
+		const li = this.element.querySelector<HTMLLIElement>(
+			`#quench-batches-list > li.test-batch[data-batch="${batchKey}"]`,
+		);
+		const contents = li?.querySelector<HTMLElement>(":scope > .expandable");
+		const summary = li?.querySelector<HTMLElement>(":scope > .batch-summary");
+		const statusIcon = summary?.querySelector<HTMLElement>(":scope > .status-icon");
+		const counts = summary?.querySelector<HTMLElement>(":scope > .batch-counts");
+		if (!li || !contents || !summary || !statusIcon || !counts) return null;
+
+		// The batch is part of the current run: reveal its summary line and mark it as running
+		const countsText = document.createTextNode("");
+		counts.replaceChildren(countsText);
+		summary.hidden = false;
+		QuenchResults._setStatusIcon(statusIcon, RUNNABLE_STATES.IN_PROGRESS);
+		const entry: BatchEntry = {
+			li,
+			contents,
+			summary,
+			statusIcon,
+			countsText,
+			passed: 0,
+			failed: 0,
+			pending: 0,
+		};
+		this._batches.set(batchKey as QuenchBatchKey, entry);
+		return entry;
+	}
+
+	/** Refresh the counts text of a batch summary line. Only a text node changes. */
+	private _updateBatchCounts(entry: BatchEntry) {
+		entry.countsText.data = QuenchResults._formatCounts(entry);
+	}
+
+	/** Format pass/fail/pending counters as a short, localized summary. */
+	private static _formatCounts(counters: RunCounters): string {
+		const parts: string[] = [];
+		if (counters.failed) parts.push(localize("StatsFailed", { failed: counters.failed }));
+		parts.push(localize("StatsPassed", { passed: counters.passed }));
+		if (counters.pending) parts.push(localize("StatsPending", { pending: counters.pending }));
+		return parts.join(", ");
+	}
+
+	/** Set the status icon of a batch summary line. Called once at batch start and once at batch end. */
+	private static _setStatusIcon(icon: HTMLElement, state: RUNNABLE_STATE) {
+		icon.className = `status-icon fas ${QuenchResults._statusIconClass(state)}`;
+	}
+
+	private static _statusIconClass(state: RUNNABLE_STATE): string {
+		switch (state) {
+			case RUNNABLE_STATES.PENDING:
+				return "fa-minus-circle";
+			case RUNNABLE_STATES.SUCCESS:
+				return "fa-check-circle";
+			case RUNNABLE_STATES.FAILURE:
+				return "fa-times-circle";
+			default:
+				return "fa-sync";
+		}
+	}
+
+	/**
+	 * Finds or creates the unordered list holding child rows inside an `.expandable` container
+	 * @param container - The `.expandable` of the parent batch or suite
+	 * @returns The `<ul>` into which child runnables can be inserted.
+	 */
+	private static _findOrMakeChildList(container: HTMLElement): HTMLUListElement {
+		const existing = container.querySelector<HTMLUListElement>(":scope > ul.runnable-list");
+		if (existing) return existing;
+		const list = document.createElement("ul");
+		list.classList.add("runnable-list");
+		container.append(list);
+		return list;
+	}
+
+	/**
+	 * Creates a new `<li>` representing a failing runnable
 	 * @param title - The runnable title to show in the UI.
 	 * @param id - The mocha id of the runnable.
 	 * @param isTest - Whether this runnable is a test (or a suite, if false)
-	 * @returns The <li> element representing this runnable.
+	 * @returns The `<li>` element representing this runnable.
 	 */
-	private _makeRunnableLineItem(title: string, id: string, isTest: boolean): HTMLLIElement {
+	private static _makeFailureLineItem(title: string, id: string, isTest: boolean): HTMLLIElement {
 		const type = isTest ? "test" : "suite";
 		const typeIcon = isTest ? "fa-flask" : "fa-folder";
 		const expanderIcon = isTest ? "fa-caret-right" : "fa-caret-down";
@@ -527,77 +672,64 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 		li.classList.add(type);
 		li.id = id;
 		li.dataset[`${type}Id`] = id;
-		li.innerHTML = `
-                <span class="summary">
-                    <i class="expander fas ${expanderIcon}" data-action="expand" data-expand-target="${id}"></i></button>
-                    <i class="status-icon"></i>
-                    <i class="type-icon fas ${typeIcon}"></i>
-                    <span class="runnable-title">${title}</span>
-                </span>
-                <div class="expandable ${isTest ? "" : "expanded"}" data-expand-id="${id}"></div>`;
-		this._updateLineItemStatus(li, RUNNABLE_STATES.IN_PROGRESS, isTest);
+
+		const summary = createNode("span", { attr: { class: "summary" } });
+		summary.append(
+			createNode("i", {
+				attr: {
+					class: `expander fas ${expanderIcon}`,
+					"data-action": "expand",
+					"data-expand-target": id,
+				},
+			}),
+			createNode("i", { attr: { class: "status-icon fas fa-times-circle" } }),
+			createNode("i", { attr: { class: `type-icon fas ${typeIcon}` } }),
+			createNode("span", { attr: { class: "runnable-title" }, children: title }),
+		);
+		const expandable = createNode("div", {
+			attr: { class: isTest ? "expandable" : "expandable expanded", "data-expand-id": id },
+		});
+		li.append(summary, expandable);
 		return li;
 	}
 
+	/** Collapse a suite row; used when a suite carries a hook diagnostic of its own. */
+	private static _collapseSuite(suiteLi: HTMLLIElement) {
+		suiteLi
+			.querySelector(":scope > .summary > .expander")
+			?.classList.replace("fa-caret-down", "fa-caret-right");
+		suiteLi.querySelector(":scope > .expandable")?.classList.remove("expanded");
+	}
+
 	/**
-	 * Updates the given existing <li> representing a runnable based on the given state
-	 * @param listElement - The list element representing the runnable
-	 * @param state - the state of the runnable
-	 * @param isTest - whether the item is a test
+	 * Return the row for a suite, materialising it and any missing ancestors on first use.
+	 * Only suites containing a failure are ever materialised.
 	 */
-	private _updateLineItemStatus(
-		listElement: HTMLLIElement,
-		state: RUNNABLE_STATE,
-		isTest?: boolean,
-	) {
-		const iconElement = listElement.querySelector(".summary > i.status-icon");
-		if (!iconElement) return;
-		let icon = "fa-sync";
-		const style = "fas";
-		switch (state) {
-			case RUNNABLE_STATES.PENDING: {
-				icon = "fa-minus-circle";
-				break;
-			}
-			case RUNNABLE_STATES.SUCCESS: {
-				icon = "fa-check-circle";
-				break;
-			}
-			case RUNNABLE_STATES.FAILURE: {
-				icon = "fa-times-circle";
-				break;
-			}
-		}
-		iconElement.classList.value = "";
-		iconElement.classList.value = `status-icon ${style} ${icon}`;
+	private _ensureSuiteLineItem(suite: Mocha.Suite, batch: BatchEntry): HTMLLIElement {
+		const existing = this._suiteElements.get(suite);
+		if (existing) return existing;
 
-		if (
-			getGame().settings.get("quench", "collapseSuccessful") &&
-			state === RUNNABLE_STATES.SUCCESS &&
-			!isTest
-		) {
-			listElement
-				.querySelector(".summary > .expander")
-				?.classList.replace("fa-caret-down", "fa-caret-right");
-			listElement.querySelector(".expandable")?.classList.remove("expanded");
-		}
+		const parent = suite.parent;
+		const parentContainer =
+			!parent || parent.root || parent._quench_batchRoot
+				? batch.contents
+				: (this._ensureSuiteLineItem(parent, batch).querySelector<HTMLElement>(
+						":scope > .expandable",
+					) ?? batch.contents);
 
-		// Hide expander for tests with results without info that could be expanded
-		if (isTest && (state === RUNNABLE_STATES.SUCCESS || state === RUNNABLE_STATES.PENDING)) {
-			listElement.querySelector(".summary > .expander")?.classList.add("quench-hidden");
-		}
+		const li = QuenchResults._makeFailureLineItem(suite.title, suite.id, false);
+		QuenchResults._findOrMakeChildList(parentContainer).append(li);
+		this._suiteElements.set(suite, li);
+		return li;
+	}
 
-		// Hide direct error message child for suites with hook errors
-		if (listElement.classList.contains("suite") && state === RUNNABLE_STATES.FAILURE) {
-			const hasError = listElement.querySelectorAll(":scope > .expandable > .error").length > 0;
-			const expandable = listElement.querySelectorAll(":scope > .expandable");
-			if (hasError) {
-				expandable[0].classList.remove("expanded");
-				listElement
-					?.querySelector(".summary > .expander")
-					?.classList.replace("fa-caret-down", "fa-caret-right");
-			}
-		}
+	/** Return the container into which a runnable's own row belongs. */
+	private _getParentContainer(parent: Mocha.Suite | undefined, batch: BatchEntry): HTMLElement {
+		if (!parent || parent.root || parent._quench_batchRoot) return batch.contents;
+		return (
+			this._ensureSuiteLineItem(parent, batch).querySelector<HTMLElement>(":scope > .expandable") ??
+			batch.contents
+		);
 	}
 
 	private static _getErrorDiff(error: {
@@ -655,7 +787,6 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 										.slice(-6)
 										.map((p) => p.trimEnd())
 										.filter(Boolean);
-						//const ellipse = startContext.length > 0 || endContext.length > 0 ? ["…\n"] : [];
 						part.value = [...startContext, "…", ...endContext, ""].join("\n");
 					}
 					// Add line break to single line parts without one
@@ -680,7 +811,7 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 	}
 
 	private _setElementDisabled(selector: string, disabled = true) {
-		const element: HTMLButtonElement | null = this.element.querySelector(selector);
+		const element = this.element?.querySelector<HTMLButtonElement>(selector);
 		if (element) element.disabled = disabled;
 	}
 
@@ -689,87 +820,53 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 	/* -------------------------------------------- */
 
 	/**
-	 * Called by {@link QuenchReporter} when a mocha suite begins running
+	 * Called by {@link QuenchReporter} when a mocha suite begins running.
+	 * Only batch roots affect the UI: their summary line is revealed and marked as running.
+	 * Nested suites are materialised lazily, and only when something inside them fails.
 	 * @param suite - The starting Mocha suite
 	 */
 	handleSuiteBegin(suite: Mocha.Suite) {
-		const batchkey = getBatchKey(suite);
-		const isBatchRoot = suite._quench_batchRoot || suite.root;
-
-		// If this suite is the root of a test batch or does not belong to a test batch, don't show in the UI.
-		if (!batchkey || isBatchRoot) return;
-
-		// Get the li to add this test batch to
-		const parentId = suite.parent?.id;
-		const batchLi: HTMLElement | null = this.element.querySelector(
-			`li.test-batch[data-batch="${batchkey}"]`,
-		);
-		const parentLi: HTMLElement | null =
-			batchLi?.querySelector(`li.suite[data-suite-id="${parentId}"]`) ?? batchLi;
-		enforce(parentLi);
-
-		// Add a li for this test batch
-		const childSuiteList = this._findOrMakeChildList(parentLi);
-		childSuiteList.insertAdjacentElement(
-			"beforeend",
-			this._makeRunnableLineItem(suite.title, suite.id, false),
-		);
+		if (suite.root || !suite._quench_batchRoot) return;
+		const entry = this._getBatchEntry(getBatchKey(suite));
+		if (entry) this._updateBatchCounts(entry);
 	}
 
 	/**
-	 * Called by {@link QuenchReporter} when a mocha suite finishes running
+	 * Called by {@link QuenchReporter} when a mocha suite finishes running.
+	 * Batch roots get their final status icon; nested suites need no work.
 	 * @param suite - The finished Mocha suite
 	 */
 	handleSuiteEnd(suite: Mocha.Suite) {
-		const isBatchRoot = suite._quench_batchRoot || suite.root;
-		if (isBatchRoot) return;
+		if (suite.root || !suite._quench_batchRoot) return;
+		const entry = this._getBatchEntry(getBatchKey(suite));
+		if (!entry) return;
 
-		const suiteLi: HTMLLIElement | null = this.element.querySelector(
-			`li.suite[data-suite-id="${suite.id}"]`,
-		);
-		enforce(suiteLi);
-		this._updateLineItemStatus(suiteLi, getSuiteState(suite));
+		let state: RUNNABLE_STATE = RUNNABLE_STATES.SUCCESS;
+		if (entry.failed) state = RUNNABLE_STATES.FAILURE;
+		else if (!entry.passed && entry.pending) state = RUNNABLE_STATES.PENDING;
+		QuenchResults._setStatusIcon(entry.statusIcon, state);
+		this._updateBatchCounts(entry);
 	}
 
 	/**
-	 * Called by {@link QuenchReporter} when a mocha test begins running
-	 * @param test - The starting test
-	 */
-	handleTestBegin(test: Mocha.Test) {
-		const batchKey = getBatchKey(test);
-		const parentId = test.parent?.id;
-
-		const batchLi: HTMLLIElement | null = this.element.querySelector(
-			`li.test-batch[data-batch="${batchKey}"]`,
-		);
-		const parentLi: HTMLLIElement | null =
-			batchLi?.querySelector(`li.suite[data-suite-id="${parentId}"]`) ?? batchLi;
-		enforce(parentLi);
-
-		const childTestList = this._findOrMakeChildList(parentLi);
-		childTestList.append(this._makeRunnableLineItem(test.title, test.id, true));
-	}
-
-	/**
-	 * Called by {@link QuenchReporter} when a mocha test finishes running
+	 * Called by {@link QuenchReporter} when a mocha test finishes running without failing
 	 *
 	 * @param test - The finished test
 	 */
 	handleTestEnd(test: Mocha.Test) {
-		let testLi: HTMLLIElement | null = this.element.querySelector(
-			`li.test[data-test-id="${test.id}"]`,
-		);
+		const state = getTestState(test);
+		const entry = this._getBatchEntry(getBatchKey(test));
 
-		// If there is not already a list item for this test, create a new one. This is necessary because `handleTestBegin` is not called
-		// automatically for "pending" tests
-		if (!testLi) {
-			this.handleTestBegin(test);
-			testLi = this.element.querySelector(`li.test[data-test-id="${test.id}"]`);
+		if (state === RUNNABLE_STATES.PENDING) {
+			this._runCounters.pending += 1;
+			if (entry) entry.pending += 1;
+		} else if (state === RUNNABLE_STATES.SUCCESS) {
+			this._runCounters.passed += 1;
+			if (entry) entry.passed += 1;
 		}
 
-		const state = getTestState(test);
-		enforce(testLi);
-		this._updateLineItemStatus(testLi, state, true);
+		if (entry) this._updateBatchCounts(entry);
+		this._updateLiveStats();
 	}
 
 	/** Create a safe failure diagnostic and immediately record its run provenance. */
@@ -814,60 +911,48 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 		};
 	}
 
-	/** Append a failed test diagnostic, creating its line item when Mocha omitted test-begin. */
-	private _appendTestFailure(test: Mocha.Test, error: unknown): HTMLElement | null {
-		const batchKey = getBatchKey(test);
-		const batchLi = batchKey
-			? this.element.querySelector<HTMLLIElement>(`li.test-batch[data-batch="${batchKey}"]`)
-			: null;
-		if (!batchLi) return null;
-
-		let testLi = batchLi.querySelector<HTMLLIElement>(`li.test[data-test-id="${test.id}"]`);
+	/** Materialise a failed test row, together with its ancestor suites, and append its diagnostic. */
+	private _appendTestFailure(test: Mocha.Test, error: unknown, batch: BatchEntry): HTMLElement {
+		let testLi = this._testElements.get(test);
 		if (!testLi) {
-			const parentLi =
-				batchLi.querySelector<HTMLLIElement>(`li.suite[data-suite-id="${test.parent?.id}"]`) ??
-				batchLi;
-			const childTestList = this._findOrMakeChildList(parentLi);
-			testLi = this._makeRunnableLineItem(test.title, test.id, true);
-			childTestList.append(testLi);
+			const container = this._getParentContainer(test.parent, batch);
+			testLi = QuenchResults._makeFailureLineItem(test.title, test.id, true);
+			QuenchResults._findOrMakeChildList(container).append(testLi);
+			this._testElements.set(test, testLi);
 		}
 
-		const expandable = testLi.querySelector<HTMLElement>(":scope > .expandable");
-		if (!expandable) return null;
+		const expandable = testLi.querySelector<HTMLElement>(":scope > .expandable") ?? testLi;
 		const diagnostic = this._createFailureDiagnostic(error);
 		expandable.append(diagnostic);
-		this._updateLineItemStatus(testLi, RUNNABLE_STATES.FAILURE, true);
 		return diagnostic;
 	}
 
-	/** Append a failed hook diagnostic to its rendered suite. */
-	private _appendSuiteHookFailure(hook: Mocha.Hook, error: unknown): HTMLElement | null {
-		const batchKey = getBatchKey(hook);
-		const batchLi = batchKey
-			? this.element.querySelector<HTMLLIElement>(`li.test-batch[data-batch="${batchKey}"]`)
-			: null;
-		const suiteLi = batchLi?.querySelector<HTMLLIElement>(
-			`li.suite[data-suite-id="${hook.parent?.id}"]`,
-		);
-		const expandable = suiteLi?.querySelector<HTMLElement>(":scope > .expandable");
-		if (!suiteLi || !expandable) return null;
+	/** Append a failed hook diagnostic to its (materialised) suite row. */
+	private _appendSuiteHookFailure(
+		hook: Mocha.Hook,
+		error: unknown,
+		batch: BatchEntry,
+	): HTMLElement | null {
+		const suite = hook.parent;
+		if (!suite || suite.root || suite._quench_batchRoot) return null;
+
+		const suiteLi = this._ensureSuiteLineItem(suite, batch);
+		const expandable = suiteLi.querySelector<HTMLElement>(":scope > .expandable");
+		if (!expandable) return null;
 
 		const heading = localize("ERROR.Hook", { hook: hook.title.replace("_root", "") });
 		const diagnostic = this._createFailureDiagnostic(error, heading);
 		expandable.append(diagnostic);
-		this._updateLineItemStatus(suiteLi, RUNNABLE_STATES.FAILURE);
+		QuenchResults._collapseSuite(suiteLi);
 		return diagnostic;
 	}
 
 	/** Append a batch-root hook summary and its adjacent diagnostic. */
-	private _appendBatchHookFailure(hook: Mocha.Hook, error: unknown): HTMLElement | null {
-		const batchKey = getBatchKey(hook);
-		const batchLi = batchKey
-			? this.element.querySelector<HTMLLIElement>(`li.test-batch[data-batch="${batchKey}"]`)
-			: null;
-		const batchContents = batchLi?.querySelector<HTMLElement>(":scope > .expandable");
-		if (!batchContents) return null;
-
+	private _appendBatchHookFailure(
+		hook: Mocha.Hook,
+		error: unknown,
+		batch: BatchEntry,
+	): HTMLElement {
 		const heading = localize("ERROR.Hook", { hook: hook.title.replace("_root", "") });
 		const summary = createNode("span", { attr: { class: "summary batch-hook" } });
 		summary.append(
@@ -886,7 +971,7 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 		});
 		const diagnostic = this._createFailureDiagnostic(error, heading);
 		expandable.append(diagnostic);
-		batchContents.before(summary, expandable);
+		batch.contents.before(summary, expandable);
 		return diagnostic;
 	}
 
@@ -914,7 +999,7 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 		const diagnostic = this._createFailureDiagnostic(error, heading);
 		expandable.append(diagnostic);
 		item.append(summary, expandable);
-		this.element.querySelector("#quench-batches-list")?.append(item);
+		this.element?.querySelector("#quench-batches-list")?.append(item);
 		return diagnostic;
 	}
 
@@ -930,16 +1015,27 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 			this._enableSnapshotUpdates = true;
 		}
 
-		if (type === "test") {
-			if (this._appendTestFailure(runnable as Mocha.Test, error)) return;
-		}
+		this._runCounters.failed += 1;
+		this._updateLiveStats();
+		if (!this.rendered) return;
 
-		if (type === "hook") {
-			const hook = runnable as Mocha.Hook;
-			const diagnostic = hook.parent?._quench_batchRoot
-				? this._appendBatchHookFailure(hook, error)
-				: this._appendSuiteHookFailure(hook, error);
-			if (diagnostic) return;
+		const batch = this._getBatchEntry(getBatchKey(runnable));
+		if (batch) {
+			batch.failed += 1;
+			this._updateBatchCounts(batch);
+
+			if (type === "test") {
+				this._appendTestFailure(runnable as Mocha.Test, error, batch);
+				return;
+			}
+
+			if (type === "hook") {
+				const hook = runnable as Mocha.Hook;
+				const diagnostic = hook.parent?._quench_batchRoot
+					? this._appendBatchHookFailure(hook, error, batch)
+					: this._appendSuiteHookFailure(hook, error, batch);
+				if (diagnostic) return;
+			}
 		}
 
 		this._appendRunFailure(runnable, error);
@@ -997,6 +1093,46 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 		}
 	}
 
+	/** The stats container at the top of the results. */
+	private _getStatsContainer(): HTMLElement | null {
+		return (
+			this._resultsRootElement?.querySelector<HTMLElement>(":scope > #quench-results-stats") ?? null
+		);
+	}
+
+	/** Show a live progress line for the run in progress. Updates only touch a text node. */
+	private _startLiveStats() {
+		this._stopLiveStats();
+		this._liveStatsText = document.createTextNode("");
+		const statsElement = createNode("div", { attr: { class: "stats" } });
+		const line = createNode("div", { attr: { class: "stats-running" } });
+		line.append(this._liveStatsText);
+		statsElement.append(line);
+
+		const container = this._getStatsContainer();
+		container?.replaceChildren(statsElement);
+		toggleHidden(container, false);
+
+		this._updateLiveStats();
+		this._liveStatsTimer = setInterval(() => this._updateLiveStats(), 1000);
+	}
+
+	/** Refresh the live progress text. */
+	private _updateLiveStats() {
+		if (!this._liveStatsText) return;
+		const elapsed = Math.round((Date.now() - this._runStartedAt) / 1000);
+		this._liveStatsText.data = localize("StatsRunning", {
+			counts: QuenchResults._formatCounts(this._runCounters),
+			elapsed,
+		});
+	}
+
+	/** Stop refreshing the live progress line. */
+	private _stopLiveStats() {
+		if (this._liveStatsTimer !== null) clearInterval(this._liveStatsTimer);
+		this._liveStatsTimer = null;
+	}
+
 	/** Construct the completed-run statistics and optional failure-navigation control. */
 	private _renderRunStats(stats: Mocha.Stats, enableFailureNavigation: boolean) {
 		this._failurePositionElement = null;
@@ -1046,6 +1182,15 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 				}),
 			);
 		}
+		if (stats.pending) {
+			results.append(
+				createNode("span", { attr: { class: "stats-info" }, children: " | " }),
+				createNode("span", {
+					attr: { class: "stats-pending" },
+					children: localize("StatsPending", { pending: stats.pending }),
+				}),
+			);
+		}
 		if (stats.failures && stats.passes) {
 			results.append(
 				createNode("span", { attr: { class: "stats-info" }, children: `(${stats.tests})` }),
@@ -1053,9 +1198,7 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 		}
 		statsElement.append(results);
 
-		const container =
-			this._resultsRootElement?.querySelector<HTMLElement>(":scope > #quench-results-stats") ??
-			null;
+		const container = this._getStatsContainer();
 		container?.replaceChildren(statsElement);
 		toggleHidden(container, false);
 	}
@@ -1065,13 +1208,19 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 	 */
 	handleRunBegin() {
 		this._resetFailureNavigation(true);
+		this._resetRunBookkeeping();
+		this._runInProgress = true;
+		this._runStartedAt = Date.now();
+		this._enableSnapshotUpdates = false;
+		if (!this.rendered) return;
+
+		this._startLiveStats();
 		// Enable/Hide buttons as necessary
 		this._setElementDisabled("#quench-select-all");
 		this._setElementDisabled("#quench-select-none");
 		this._setElementDisabled("#quench-run");
 		toggleHidden(this.element.querySelector("#quench-abort"), false);
 		toggleHidden(this.element.querySelector("#quench-update-snapshots"), true);
-		this._enableSnapshotUpdates = false;
 	}
 
 	/**
@@ -1079,7 +1228,12 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 	 * @param stats - Run statistics
 	 */
 	handleRunEnd(stats: Mocha.Stats) {
+		this._runInProgress = false;
+		this._stopLiveStats();
+		this._liveStatsText = null;
 		this._resetFailureNavigation(false);
+		if (!this.rendered) return;
+
 		this._cacheFailureTargets();
 		const countsAgree = this._failureTargets.length === stats.failures;
 		if (stats.failures > 0 && !countsAgree) {
