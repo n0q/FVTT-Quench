@@ -37,7 +37,8 @@
 		},
 		"ERROR": {
 			"InvalidPackageName": "QUENCH: Test batch \"{key}\" uses invalid package ID \"{packageName}\". Batch names should begin with the registering package's ID!",
-			"Hook": "Error in the {hook}"
+			"Hook": "Error in the {hook}",
+			"RunSetup": "QUENCH: Run setup failed, tests were not run: {message}"
 		}
 	}
 }

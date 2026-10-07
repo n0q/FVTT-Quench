@@ -109,6 +109,8 @@ Hooks.on("ready", async () => {
 	if (shouldRender) await quench.app.render({ force: true });
 	if (autoRun) {
 		// Only run tests included in the filter and registered as preSelected
-		quench.runBatches(getFilterSetting(), { preSelectedOnly: true });
+		quench.runBatches(getFilterSetting(), { preSelectedOnly: true }).catch(() => {
+			// A failing run setup is reported by `runBatches` itself
+		});
 	}
 });

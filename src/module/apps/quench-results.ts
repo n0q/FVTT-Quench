@@ -251,7 +251,9 @@ export class QuenchResults extends HandlebarsApplicationMixin(ApplicationV2)<Que
 	 */
 	static async _onRun(this: QuenchResults, _event: Event, _target: HTMLElement) {
 		const enabledBatches: QuenchBatchKey[] = this._getCheckedBatches();
-		await this.quench.runBatches(enabledBatches);
+		await this.quench.runBatches(enabledBatches).catch(() => {
+			// A failing run setup is reported by `runBatches` itself
+		});
 	}
 
 	/**

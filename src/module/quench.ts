@@ -78,6 +78,13 @@ export class Quench {
 	declare readonly _testBatches: Collection<QuenchBatchData>;
 
 	/**
+	 * Functions run at the start of every batch run, in registration order
+	 *
+	 * @internal
+	 */
+	declare readonly _runSetups: Set<QuenchRunSetupFunction>;
+
+	/**
 	 * The current Mocha runner, if any
 	 *
 	 * @internal
@@ -115,6 +122,9 @@ export class Quench {
 			},
 			_testBatches: {
 				value: new Collection(),
+			},
+			_runSetups: {
+				value: new Set(),
 			},
 		});
 	}
@@ -196,6 +206,51 @@ export class Quench {
 	}
 
 	/**
+	 * Registers a function to be run once at the start of every batch run, e.g. to bring the world into the state tests expect.
+	 *
+	 * The function is called each time {@link runBatches} is executed (including runs started from the Quench window),
+	 * and never at load or registration time. It is awaited before any batch's registration function is called,
+	 * and thus before any `before` hook or test of that run.
+	 * Multiple functions are run one after another in the order of their registration.
+	 *
+	 * If the function throws or returns a rejecting promise, the run is not started: an error notification is shown
+	 * and {@link runBatches} rejects with the original error.
+	 *
+	 * @param fn - The function to run; receives a {@link QuenchRunSetupContext} describing the run about to start.
+	 * @returns A function that removes the registration again.
+	 * @example
+	 * Hooks.on("quenchReady", (quench) => {
+	 *   quench.registerRunSetup(async ({ batchKeys }) => {
+	 *     if (!batchKeys.some((key) => key.startsWith("my-package."))) return;
+	 *     await Combat.deleteDocuments(game.combats.map((combat) => combat.id));
+	 *   });
+	 * });
+	 */
+	registerRunSetup(fn: QuenchRunSetupFunction): () => void {
+		this._runSetups.add(fn);
+		return () => {
+			this._runSetups.delete(fn);
+		};
+	}
+
+	/**
+	 * Runs all functions registered with {@link registerRunSetup} for a run about to start.
+	 *
+	 * @internal
+	 * @param context - The context passed to each function
+	 */
+	async _runSetup(context: QuenchRunSetupContext): Promise<void> {
+		try {
+			for (const fn of this._runSetups) await fn(context);
+		} catch (error) {
+			console.error("QUENCH | Run setup failed, aborting test run", error);
+			const message = error instanceof Error ? error.message : String(error);
+			ui?.notifications?.error(localize("ERROR.RunSetup", { message }), { permanent: true });
+			throw error;
+		}
+	}
+
+	/**
 	 * Runs the test batches defined by the keys in their {@link Quench.registerBatch | registration}.
 	 *
 	 * The contents of the test batches are registered with mocha when this function is executed.
@@ -227,6 +282,7 @@ export class Quench {
 	 *   - `**` matches zero or more arbitrary characters, including the separator `.`
 	 * @param [options] - Additional options affecting this batch run
 	 * @returns Returns the mocha Runner object for this test run.
+	 * @throws If a function registered with {@link registerRunSetup} fails; the run is not started in that case.
 	 */
 	async runBatches(keys: string | string[] = "**", options: QuenchRunBatchOptions = {}) {
 		let { updateSnapshots } = options;
@@ -247,6 +303,9 @@ export class Quench {
 		// @ts-expect-error Types are missing `isRoot` argument TODO: PR for DefinitelyTyped?
 		this.mocha.suite = new Mocha.Suite("__root", new Mocha.Context(), true);
 		await this.app.clear();
+
+		// Let packages prepare the world before anything belonging to this run is registered or executed
+		await this._runSetup({ batchKeys: [...batchKeys], options });
 
 		// Initialize mocha with a QuenchReporter
 		this.mocha.setup({
@@ -350,6 +409,31 @@ export type QuenchRegisterBatchFunction = (
 	this: Mocha.Suite,
 	context: QuenchBatchContext,
 ) => void | Promise<void>;
+
+/**
+ * A function run once at the start of every batch run, before any batch is registered with Mocha.
+ * The run does not begin until the returned promise, if any, has settled.
+ *
+ * @public
+ * @param context - Information about the run about to start
+ */
+export type QuenchRunSetupFunction = (context: QuenchRunSetupContext) => void | Promise<void>;
+
+/**
+ * Information about a batch run that is about to start, passed to functions
+ * registered with {@link Quench.registerRunSetup}.
+ *
+ * @public
+ */
+export interface QuenchRunSetupContext {
+	/**
+	 * The keys of all batches included in this run, after filtering.
+	 * Empty if the run does not include any batch.
+	 */
+	batchKeys: QuenchBatchKey[];
+	/** The options {@link Quench.runBatches} was called with. */
+	options: QuenchRunBatchOptions;
+}
 
 /**
  * A context object passed to batch registration functions, containing functions usually
